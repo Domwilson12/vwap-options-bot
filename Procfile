@@ -1,0 +1,1 @@
+worker: python intraday_vwap_bot.py
