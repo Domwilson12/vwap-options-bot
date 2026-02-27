@@ -1,8 +1,18 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
 import os
+import requests
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+print("Testing Discord webhook...")
+
+if WEBHOOK_URL:
+    requests.post(WEBHOOK_URL, json={"content": "🚀 Railway webhook test successful 🚀"})
+    print("Test message sent.")
+else:
+    print("WEBHOOK_URL not found.")
 from datetime import datetime, time
 from scipy.stats import norm
 
@@ -10,7 +20,6 @@ from scipy.stats import norm
 # SETTINGS
 # ==========================
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/1476365069179682858/epTmmPV2WEhkmK59kLpp01f9SvbHWbvKi7DWo9Lo0JjhD0_P0WroOZtS4R-_NfUc46zm"
 SYMBOL = "SPY"
 ACCOUNT_SIZE = 10000
 RISK_PERCENT = 0.01
@@ -166,4 +175,5 @@ if current_signal != last_signal and current_signal in ["LONG", "SHORT"]:
     save_signal(current_signal)
 
 else:
+
     print("No new signal.")
