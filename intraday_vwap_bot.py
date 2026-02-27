@@ -3,16 +3,6 @@ import pandas as pd
 import numpy as np
 import os
 import requests
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-print("Testing Discord webhook...")
-
-if WEBHOOK_URL:
-    requests.post(WEBHOOK_URL, json={"content": "🚀 Railway webhook test successful 🚀"})
-    print("Test message sent.")
-else:
-    print("WEBHOOK_URL not found.")
 from datetime import datetime, time
 from scipy.stats import norm
 
@@ -177,3 +167,4 @@ if current_signal != last_signal and current_signal in ["LONG", "SHORT"]:
 else:
 
     print("No new signal.")
+
