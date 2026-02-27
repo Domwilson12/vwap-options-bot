@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 import os
 import requests
-from datetime import datetime, time
+import time
+from datetime import datetime, time as dt_time
 from scipy.stats import norm
 
 # ==========================
@@ -16,7 +17,10 @@ RISK_PERCENT = 0.01
 TARGET_DELTA = 0.60
 DEVIATION_THRESHOLD = 0.006
 RSI_PERIOD = 14
-STATE_FILE = "bot_state.txt"
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+LAST_SIGNAL = None
 
 # ==========================
 # FUNCTIONS
@@ -36,17 +40,13 @@ def compute_vwap(group):
     return (tp * group["Volume"]).cumsum() / group["Volume"].cumsum()
 
 def send_discord(message):
-    requests.post(WEBHOOK_URL, json={"content": message})
-
-def get_last_signal():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return f.read().strip()
-    return None
-
-def save_signal(signal):
-    with open(STATE_FILE, "w") as f:
-        f.write(signal)
+    payload = {
+        "content": f"@everyone\n{message}",
+        "allowed_mentions": {
+            "parse": ["everyone"]
+        }
+    }
+    requests.post(WEBHOOK_URL, json=payload)
 
 def estimate_delta(S, K, T, r=0.01, sigma=0.20, call=True):
     if T <= 0:
@@ -58,60 +58,79 @@ def estimate_delta(S, K, T, r=0.01, sigma=0.20, call=True):
         return -norm.cdf(-d1)
 
 # ==========================
-# GET PRICE DATA
+# MAIN LOOP
 # ==========================
 
-df = yf.download(SYMBOL, period="5d", interval="5m", progress=False)
+def run_bot():
+    global LAST_SIGNAL
 
-if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.get_level_values(0)
+    print("Checking market...")
 
-df = df[["Open","High","Low","Close","Volume"]].copy()
+    df = yf.download(SYMBOL, period="5d", interval="5m", progress=False)
 
-if df.index.tz is None:
-    df.index = df.index.tz_localize("UTC").tz_convert("US/Eastern")
-else:
-    df.index = df.index.tz_convert("US/Eastern")
+    if df.empty:
+        print("No data.")
+        return
 
-df = df[(df.index.time >= time(9,30)) & (df.index.time <= time(16,0))]
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-df["date"] = df.index.date
-df["vwap"] = df.groupby("date", group_keys=False).apply(compute_vwap)
-df["rsi"] = compute_rsi(df["Close"], RSI_PERIOD)
-df.dropna(inplace=True)
+    df = df[["Open","High","Low","Close","Volume"]].copy()
 
-latest = df.iloc[-1]
-current_time = latest.name.time()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert("US/Eastern")
+    else:
+        df.index = df.index.tz_convert("US/Eastern")
 
-if not (time(10,0) <= current_time <= time(15,30)):
-    print("Outside trade window.")
-    exit()
+    df = df[(df.index.time >= dt_time(9,30)) & (df.index.time <= dt_time(16,0))]
 
-deviation = (latest["Close"] - latest["vwap"]) / latest["vwap"]
+    if df.empty:
+        print("Outside market hours.")
+        return
 
-long_signal = deviation < -DEVIATION_THRESHOLD and latest["rsi"] < 30
-short_signal = deviation > DEVIATION_THRESHOLD and latest["rsi"] > 70
+    df["date"] = df.index.date
+    df["vwap"] = df.groupby("date", group_keys=False).apply(compute_vwap)
+    df["rsi"] = compute_rsi(df["Close"], RSI_PERIOD)
+    df.dropna(inplace=True)
 
-last_signal = get_last_signal()
+    latest = df.iloc[-1]
+    current_time = latest.name.time()
 
-if long_signal:
-    current_signal = "LONG"
-elif short_signal:
-    current_signal = "SHORT"
-else:
-    current_signal = "NONE"
+    if not (dt_time(10,0) <= current_time <= dt_time(15,30)):
+        print("Outside trade window.")
+        return
 
-if current_signal != last_signal and current_signal in ["LONG", "SHORT"]:
+    deviation = (latest["Close"] - latest["vwap"]) / latest["vwap"]
+
+    long_signal = deviation < -DEVIATION_THRESHOLD and latest["rsi"] < 30
+    short_signal = deviation > DEVIATION_THRESHOLD and latest["rsi"] > 70
+
+    if long_signal:
+        current_signal = "LONG"
+    elif short_signal:
+        current_signal = "SHORT"
+    else:
+        current_signal = "NONE"
+
+    if current_signal == LAST_SIGNAL or current_signal == "NONE":
+        print("No new signal.")
+        return
+
+    LAST_SIGNAL = current_signal
 
     ticker = yf.Ticker(SYMBOL)
     expirations = ticker.options
-    expiration = expirations[0]  # nearest expiry
 
+    if not expirations:
+        print("No expirations found.")
+        return
+
+    expiration = expirations[0]
     chain = ticker.option_chain(expiration)
     options = chain.calls if current_signal == "LONG" else chain.puts
 
     S = latest["Close"]
-    T = 1/365  # assume 1 day to expiry for intraday
+    T = 1/365
 
     best_option = None
     best_delta_diff = 999
@@ -119,12 +138,13 @@ if current_signal != last_signal and current_signal in ["LONG", "SHORT"]:
     for _, row in options.iterrows():
         K = row["strike"]
         mid_price = (row["bid"] + row["ask"]) / 2
-        delta = estimate_delta(S, K, T, call=(current_signal=="LONG"))
 
         if np.isnan(mid_price) or mid_price <= 0:
             continue
 
+        delta = estimate_delta(S, K, T, call=(current_signal=="LONG"))
         diff = abs(abs(delta) - TARGET_DELTA)
+
         if diff < best_delta_diff:
             best_delta_diff = diff
             best_option = {
@@ -133,38 +153,35 @@ if current_signal != last_signal and current_signal in ["LONG", "SHORT"]:
                 "delta": delta
             }
 
-    if best_option:
+    if not best_option:
+        print("No suitable option found.")
+        return
 
-        entry_price = best_option["price"]
-        delta = best_option["delta"]
-        strike = best_option["strike"]
+    entry_price = best_option["price"]
+    delta = best_option["delta"]
+    strike = best_option["strike"]
 
-        target_move = latest["vwap"] - S
-        expected_option_move = delta * target_move
+    risk_amount = ACCOUNT_SIZE * RISK_PERCENT
+    contracts = int(risk_amount / (entry_price * 100))
 
-        expected_profit = expected_option_move * 100
-        risk_per_contract = entry_price * 100
+    message = (
+        f"🚨 VWAP OPTIONS SIGNAL 🚨\n\n"
+        f"Direction: {current_signal}\n"
+        f"Expiration: {expiration}\n"
+        f"Strike: {strike}\n"
+        f"Est Premium: ${round(entry_price,2)}\n"
+        f"Delta: {round(delta,2)}\n\n"
+        f"Contracts (1% risk): {contracts}"
+    )
 
-        risk_amount = ACCOUNT_SIZE * RISK_PERCENT
-        contracts = int(risk_amount / risk_per_contract)
+    send_discord(message)
+    print("Signal sent.")
 
-        message = (
-            f"🚨 VWAP OPTIONS SIGNAL 🚨\n\n"
-            f"Direction: {current_signal}\n"
-            f"Expiration: {expiration}\n"
-            f"Strike: {strike}\n"
-            f"Est. Option Price: ${round(entry_price,2)}\n"
-            f"Delta: {round(delta,2)}\n\n"
-            f"Contracts (1% risk): {contracts}\n"
-            f"Expected Profit if VWAP hit: ${round(expected_profit * contracts,2)}"
-        )
+if __name__ == "__main__":
+    while True:
+        try:
+            run_bot()
+        except Exception as e:
+            print("Error:", e)
 
-        send_discord(message)
-        print("Advanced options signal sent.")
-
-    save_signal(current_signal)
-
-else:
-
-    print("No new signal.")
-
+        time.sleep(300)
